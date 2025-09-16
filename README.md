@@ -63,7 +63,7 @@ Levelled operatives can trigger **one perk per hack** using quick commands:
   *Subnet:* “Holding the gate. Window extended ten seconds.”
 
 - `\p3 — Bypass`  
-  **Instant success** (auto-completes the hack and awards XP).  
+  **Instant success** (auto-completes the hack and awards XP) *Can only be used once per day  
   *Subnet:* “Bypass injected. ATC uplink green.”
 
 - `\p4 — Overclock`  
