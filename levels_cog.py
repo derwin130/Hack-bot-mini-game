@@ -1,441 +1,247 @@
 import asyncio
-import datetime as dt
-from dataclasses import dataclass
-from typing import Optional, Tuple, Dict
-
+import time
+from types import SimpleNamespace
+from typing import Tuple, Optional, List
 import aiosqlite
 import discord
 from discord.ext import commands
 
-# =========================
-# CONFIG
-# =========================
 DB_PATH = "levels.sqlite3"
 
-# Level thresholds (0 → 4)
-LEVEL_THRESHOLDS = [0, 100, 300, 600, 1000]
-MAX_LEVEL = 4
+# XP thresholds → levels (0–4)
+# tweak as you like
+LEVEL_THRESHOLDS = [0, 50, 150, 300, 600]  # xp required to be >= this to reach that level index
 
-# XP awards
-BASE_HACK_XP = 50
-# Only two difficulties now
-DIFFICULTY_BONUS = {"easy": 0, "hard": 50}
-FIRST_SUCCESS_DAILY_BONUS = 25
-FAILURE_XP = 5  # Optional tiny learning XP
-DAILY_LOGIN_BONUS = 5
+DAILY_BONUS_XP = 10
+DAILY_BONUS_COOLDOWN = 20 * 60 * 60  # 20 hours
 
-# Anti-abuse
-MIN_PUZZLE_TIME_SEC = 6  # ignore completions faster than this
-FULL_XP_HACKS_PER_HOUR = 5
-REDUCED_XP_HACKS_PER_HOUR = 10
-REDUCED_RATE = 0.2  # 20% XP after first 5 in an hour; after 10 -> 0 XP
-DAILY_XP_CAP = 500
+# Hack success base XP
+EASY_BASE_XP = 8
+HARD_BASE_XP = 15
 
-# Optional: map levels to role IDs per guild (you can fill at runtime)
-ROLE_MAP_BY_GUILD: Dict[int, Dict[int, int]] = {}
+# Speed bonus caps
+EASY_BEST_SECONDS = 25
+HARD_BEST_SECONDS = 40
+SPEED_BONUS_MAX = 10  # extra XP at best times
 
-# =========================
-# DATA SHAPES
-# =========================
-@dataclass
-class UserState:
-    user_id: int
-    guild_id: int
-    level: int
-    xp: int
-    hacks_completed: int
-    last_online_at: Optional[str]
-    last_hack_at: Optional[str]
-    streak_count: int
-    last_daily_bonus_at: Optional[str]
-    daily_xp_earned: int
-    daily_reset_at: Optional[str]
+# Perk/cooldown
+P3_COOLDOWN_SECONDS = 24 * 60 * 60  # once per day
 
-# =========================
-# UTIL
-# =========================
-def utc_now() -> dt.datetime:
-    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+class UserStore:
+    def __init__(self, db: aiosqlite.Connection):
+        self.db = db
 
-def to_date_str(ts: dt.datetime) -> str:
-    return ts.date().isoformat()
+    async def init_tables(self):
+        await self.db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            xp INTEGER NOT NULL DEFAULT 0,
+            level INTEGER NOT NULL DEFAULT 0,
+            last_login_epoch REAL DEFAULT NULL,
+            PRIMARY KEY (user_id, guild_id)
+        )""")
+        await self.db.execute("""
+        CREATE TABLE IF NOT EXISTS perk_meta (
+            user_id INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            last_p3_epoch REAL DEFAULT NULL,
+            PRIMARY KEY (user_id, guild_id)
+        )""")
+        await self.db.commit()
 
-def level_for_xp(xp: int) -> int:
-    lvl = 0
-    for i, threshold in enumerate(LEVEL_THRESHOLDS):
-        if xp >= threshold:
-            lvl = i
-    return min(lvl, MAX_LEVEL)
+    async def get_or_create_user(self, user_id: int, guild_id: int) -> SimpleNamespace:
+        cur = await self.db.execute(
+            "SELECT xp, level, last_login_epoch FROM users WHERE user_id=? AND guild_id=?",
+            (int(user_id), int(guild_id))
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row:
+            xp, level, last_login = row
+            return SimpleNamespace(user_id=user_id, guild_id=guild_id, xp=int(xp), level=int(level), last_login_epoch=last_login)
+        await self.db.execute(
+            "INSERT INTO users (user_id, guild_id, xp, level, last_login_epoch) VALUES (?,?,?,?,?)",
+            (int(user_id), int(guild_id), 0, 0, None)
+        )
+        await self.db.commit()
+        return SimpleNamespace(user_id=user_id, guild_id=guild_id, xp=0, level=0, last_login_epoch=None)
 
-def next_threshold(level: int) -> Optional[int]:
-    if level >= MAX_LEVEL:
+    async def update_user(self, user_id: int, guild_id: int, *, xp: Optional[int]=None, level: Optional[int]=None, last_login_epoch: Optional[float]=None):
+        state = await self.get_or_create_user(user_id, guild_id)
+        xp = state.xp if xp is None else int(xp)
+        level = state.level if level is None else int(level)
+        last_login_epoch = state.last_login_epoch if last_login_epoch is None else last_login_epoch
+        await self.db.execute(
+            "UPDATE users SET xp=?, level=?, last_login_epoch=? WHERE user_id=? AND guild_id=?",
+            (xp, level, last_login_epoch, int(user_id), int(guild_id))
+        )
+        await self.db.commit()
+
+    async def recompute_level(self, xp: int) -> int:
+        lvl = 0
+        for i, threshold in enumerate(LEVEL_THRESHOLDS):
+            if xp >= threshold:
+                lvl = i
+        # clamp to 4
+        return min(lvl, 4)
+
+    async def top_users(self, guild_id: int, limit: int = 10) -> List[SimpleNamespace]:
+        cur = await self.db.execute(
+            "SELECT user_id, xp, level FROM users WHERE guild_id=? ORDER BY xp DESC, level DESC LIMIT ?",
+            (int(guild_id), int(limit))
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        out = []
+        for uid, xp, level in rows:
+            out.append(SimpleNamespace(user_id=int(uid), guild_id=int(guild_id), xp=int(xp), level=int(level)))
+        return out
+
+    # Perk p3 meta
+    async def get_last_p3(self, user_id: int, guild_id: int) -> Optional[float]:
+        cur = await self.db.execute("SELECT last_p3_epoch FROM perk_meta WHERE user_id=? AND guild_id=?", (int(user_id), int(guild_id)))
+        row = await cur.fetchone()
+        await cur.close()
+        if row:
+            return row[0]
         return None
-    return LEVEL_THRESHOLDS[level + 1]
 
-async def fetchone_dict(cur) -> Optional[dict]:
-    row = await cur.fetchone()
-    if row is None:
-        return None
-    cols = [c[0] for c in cur.description]
-    return dict(zip(cols, row))
+    async def set_last_p3(self, user_id: int, guild_id: int, when: float):
+        await self.db.execute(
+            "INSERT INTO perk_meta (user_id, guild_id, last_p3_epoch) VALUES (?,?,?) "
+            "ON CONFLICT(user_id, guild_id) DO UPDATE SET last_p3_epoch=excluded.last_p3_epoch",
+            (int(user_id), int(guild_id), float(when))
+        )
+        await self.db.commit()
 
-# =========================
-# CORE STORAGE LAYER
-# =========================
-class LevelStore:
-    def __init__(self, path: str):
-        self.path = path
-        self._lock = asyncio.Lock()
 
-    async def init(self):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS users(
-              user_id INTEGER NOT NULL,
-              guild_id INTEGER NOT NULL,
-              level INTEGER NOT NULL DEFAULT 0,
-              xp INTEGER NOT NULL DEFAULT 0,
-              hacks_completed INTEGER NOT NULL DEFAULT 0,
-              last_online_at TEXT,
-              last_hack_at TEXT,
-              streak_count INTEGER NOT NULL DEFAULT 0,
-              last_daily_bonus_at TEXT,
-              daily_xp_earned INTEGER NOT NULL DEFAULT 0,
-              daily_reset_at TEXT,
-              PRIMARY KEY(user_id, guild_id)
-            )
-            """)
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS xp_log(
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              user_id INTEGER NOT NULL,
-              guild_id INTEGER NOT NULL,
-              amount INTEGER NOT NULL,
-              reason TEXT NOT NULL,
-              created_at TEXT NOT NULL
-            )
-            """)
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS hack_log(
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              user_id INTEGER NOT NULL,
-              guild_id INTEGER NOT NULL,
-              difficulty TEXT NOT NULL,
-              duration_sec REAL NOT NULL,
-              created_at TEXT NOT NULL
-            )
-            """)
-            await db.commit()
-
-    async def get_or_create_user(self, user_id: int, guild_id: int) -> UserState:
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute("SELECT * FROM users WHERE user_id=? AND guild_id=?", (user_id, guild_id))
-            row = await fetchone_dict(cur); await cur.close()
-            if row:
-                return UserState(**row)
-            await db.execute("""
-            INSERT INTO users(user_id, guild_id, level, xp, hacks_completed,
-                              last_online_at, last_hack_at, streak_count,
-                              last_daily_bonus_at, daily_xp_earned, daily_reset_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            """, (user_id, guild_id, 0, 0, 0, None, None, 0, None, 0, None))
-            await db.commit()
-            return UserState(user_id, guild_id, 0, 0, 0, None, None, 0, None, 0, None)
-
-    async def _maybe_reset_daily(self, state: UserState, db):
-        today = to_date_str(utc_now())
-        if state.daily_reset_at != today:
-            state.daily_reset_at = today
-            state.daily_xp_earned = 0
-            await db.execute("""
-            UPDATE users SET daily_xp_earned=?, daily_reset_at=? 
-            WHERE user_id=? AND guild_id=?
-            """, (state.daily_xp_earned, state.daily_reset_at, state.user_id, state.guild_id))
-
-    async def add_xp(self, user_id: int, guild_id: int, amount: int, reason: str) -> Tuple[UserState, int, bool]:
-        """
-        Returns: (updated_state, applied_amount, leveled_up_bool)
-        Respects DAILY_XP_CAP.
-        """
-        async with self._lock:
-            async with aiosqlite.connect(self.path) as db:
-                cur = await db.execute("SELECT * FROM users WHERE user_id=? AND guild_id=?", (user_id, guild_id))
-                row = await fetchone_dict(cur); await cur.close()
-                if not row:
-                    state = await self.get_or_create_user(user_id, guild_id)
-                else:
-                    state = UserState(**row)
-
-                await self._maybe_reset_daily(state, db)
-
-                remaining_cap = max(0, DAILY_XP_CAP - state.daily_xp_earned)
-                applied = max(0, min(amount, remaining_cap))
-                if applied > 0:
-                    new_xp = state.xp + applied
-                    old_level = state.level
-                    new_level = level_for_xp(new_xp)
-
-                    state.xp = new_xp
-                    state.level = new_level
-                    state.daily_xp_earned += applied
-
-                    await db.execute("""
-                    UPDATE users SET xp=?, level=?, daily_xp_earned=? WHERE user_id=? AND guild_id=?
-                    """, (state.xp, state.level, state.daily_xp_earned, user_id, guild_id))
-
-                    await db.execute("""
-                    INSERT INTO xp_log(user_id, guild_id, amount, reason, created_at)
-                    VALUES(?,?,?,?,?)
-                    """, (user_id, guild_id, applied, reason, utc_now().isoformat()))
-                    leveled_up = new_level > old_level
-                else:
-                    leveled_up = False
-
-                await db.commit()
-                return state, applied, leveled_up
-
-    async def log_hack(self, user_id: int, guild_id: int, difficulty: str, duration_sec: float):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute("""
-            INSERT INTO hack_log(user_id, guild_id, difficulty, duration_sec, created_at)
-            VALUES(?,?,?,?,?)
-            """, (user_id, guild_id, difficulty, float(duration_sec), utc_now().isoformat()))
-            await db.commit()
-
-    async def update_user_meta(self, user_id: int, guild_id: int, **fields):
-        if not fields:
-            return
-        sets = ", ".join([f"{k}=?" for k in fields])
-        values = list(fields.values()) + [user_id, guild_id]
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(f"UPDATE users SET {sets} WHERE user_id=? AND guild_id=?", values)
-            await db.commit()
-
-    async def top_users(self, guild_id: int, limit: int = 10):
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute("""
-            SELECT * FROM users WHERE guild_id=? ORDER BY level DESC, xp DESC LIMIT ?
-            """, (guild_id, limit))
-            rows = await cur.fetchall()
-            cols = [c[0] for c in cur.description]
-            await cur.close()
-            return [dict(zip(cols, r)) for r in rows]
-
-# =========================
-# SERVICE (awards, rules)
-# =========================
-class LevelService:
-    def __init__(self, store: LevelStore):
-        self.store = store
-
-    async def record_online(self, member: discord.Member) -> Tuple[UserState, int, bool]:
-        """
-        Apply daily login bonus at most once per day.
-        """
-        state = await self.store.get_or_create_user(member.id, member.guild.id)
-        today = to_date_str(utc_now())
-        applied = 0
-        leveled = False
-        if state.last_daily_bonus_at != today:
-            state, applied, leveled = await self.store.add_xp(member.id, member.guild.id, DAILY_LOGIN_BONUS, "daily_login")
-            await self.store.update_user_meta(member.id, member.guild.id,
-                                              last_online_at=utc_now().isoformat(),
-                                              last_daily_bonus_at=today)
-        else:
-            await self.store.update_user_meta(member.id, member.guild.id,
-                                              last_online_at=utc_now().isoformat())
-        return state, applied, leveled
-
-    async def record_hack_success(self, member: discord.Member, difficulty: str = "easy",
-                                  duration_sec: float = 10.0) -> Tuple[UserState, int, bool, str]:
-        """
-        Awards XP with difficulty bonuses, per-hour diminishing returns, and first-success-of-day bonus.
-        Difficulty is 'easy' or 'hard' (fallback to 'easy').
-        Returns: (state, applied_xp, leveled_up, note)
-        """
-        difficulty = (difficulty or "easy").lower()
-        if difficulty not in DIFFICULTY_BONUS:
-            difficulty = "easy"
-
-        if duration_sec < MIN_PUZZLE_TIME_SEC:
-            await self.store.log_hack(member.id, member.guild.id, difficulty, duration_sec)
-            return await self.store.get_or_create_user(member.id, member.guild.id), 0, False, "Ignored: too fast"
-
-        # Count hacks in the past hour for diminishing returns
-        async with aiosqlite.connect(self.store.path) as db:
-            one_hour_ago = (utc_now() - dt.timedelta(hours=1)).isoformat()
-            cur = await db.execute("""
-            SELECT COUNT(*) FROM hack_log 
-            WHERE user_id=? AND guild_id=? AND created_at>=?
-            """, (member.id, member.guild.id, one_hour_ago))
-            count_in_hour = (await cur.fetchone())[0]
-            await cur.close()
-
-        base = BASE_HACK_XP + DIFFICULTY_BONUS[difficulty]
-        multiplier = 1.0
-        if count_in_hour >= FULL_XP_HACKS_PER_HOUR:
-            if count_in_hour < REDUCED_XP_HACKS_PER_HOUR:
-                multiplier = REDUCED_RATE
-            else:
-                multiplier = 0.0
-
-        award = int(base * multiplier)
-
-        # First success of the day bonus?
-        async with aiosqlite.connect(self.store.path) as db:
-            today = to_date_str(utc_now())
-            cur = await db.execute("""
-            SELECT COUNT(*) FROM xp_log 
-            WHERE user_id=? AND guild_id=? AND reason='hack_success' AND created_at LIKE ?
-            """, (member.id, member.guild.id, f"{today}%"))
-            successes_today = (await cur.fetchone())[0]
-            await cur.close()
-
-        note_parts = []
-        if multiplier == 0.0:
-            note_parts.append("No XP (hourly limit reached)")
-        elif multiplier == REDUCED_RATE:
-            note_parts.append("Reduced XP (diminishing returns)")
-
-        if successes_today == 0 and award > 0:
-            award += FIRST_SUCCESS_DAILY_BONUS
-            note_parts.append(f"+{FIRST_SUCCESS_DAILY_BONUS} daily bonus")
-
-        await self.store.log_hack(member.id, member.guild.id, difficulty, duration_sec)
-        state, applied, leveled = await self.store.add_xp(member.id, member.guild.id, award, "hack_success")
-
-        await self.store.update_user_meta(member.id, member.guild.id,
-                                          hacks_completed=state.hacks_completed + 1,
-                                          last_hack_at=utc_now().isoformat())
-        state = await self.store.get_or_create_user(member.id, member.guild.id)
-
-        return state, applied, leveled, "; ".join(note_parts) if note_parts else "OK"
-
-    async def record_hack_failure(self, member: discord.Member) -> Tuple[UserState, int, bool]:
-        state, applied, leveled = await self.store.add_xp(member.id, member.guild.id, FAILURE_XP, "hack_failure")
-        return state, applied, leveled
-
-# =========================
-# COG WITH COMMANDS
-# =========================
 class LevelsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.store = LevelStore(DB_PATH)
-        self.svc = LevelService(self.store)
-        self.ready = False
-        self.bot.loop.create_task(self._init_once())
+        self.db: aiosqlite.Connection = None  # type: ignore
+        self.store: UserStore = None  # type: ignore
 
-    async def _init_once(self):
-        await self.store.init()
-        self.ready = True
+    async def cog_load(self):
+        self.db = await aiosqlite.connect(DB_PATH)
+        await self.db.execute("PRAGMA journal_mode=WAL;")
+        await self.db.execute("PRAGMA synchronous=NORMAL;")
+        self.store = UserStore(self.db)
+        await self.store.init_tables()
 
-    # Public APIs you can call from other parts of your bot:
+    async def cog_unload(self):
+        if self.db:
+            await self.db.close()
+
+    # ---------- XP/Level Logic ----------
+
     async def record_online(self, member: discord.Member):
-        return await self.svc.record_online(member)
+        """Daily login bonus."""
+        st = await self.store.get_or_create_user(member.id, member.guild.id)
+        now = time.time()
+        applied = 0
+        leveled = False
+        if (st.last_login_epoch is None) or (now - float(st.last_login_epoch) >= DAILY_BONUS_COOLDOWN):
+            new_xp = st.xp + DAILY_BONUS_XP
+            new_level = await self.store.recompute_level(new_xp)
+            leveled = new_level > st.level
+            await self.store.update_user(member.id, member.guild.id, xp=new_xp, level=new_level, last_login_epoch=now)
+            st.xp, st.level, st.last_login_epoch = new_xp, new_level, now
+            applied = DAILY_BONUS_XP
+        return st, applied, leveled
 
-    async def record_hack_success(self, member: discord.Member, difficulty: str = "easy", duration_sec: float = 10.0):
-        return await self.svc.record_hack_success(member, difficulty, duration_sec)
+    async def record_hack_success(self, member: discord.Member, *, difficulty: str, duration_sec: float):
+        """Award XP for a successful hack. Returns (state, applied_xp, leveled, note)."""
+        base = EASY_BASE_XP if difficulty == "easy" else HARD_BASE_XP
+        best = EASY_BEST_SECONDS if difficulty == "easy" else HARD_BEST_SECONDS
 
-    async def record_hack_failure(self, member: discord.Member):
-        return await self.svc.record_hack_failure(member)
+        # Simple linear speed bonus: if you solve in <= best sec, +SPEED_BONUS_MAX; linearly down to +0 at 2*best
+        bonus = 0
+        if duration_sec <= 2 * best:
+            # map [2*best .. best] -> [0 .. SPEED_BONUS_MAX]
+            ratio = max(0.0, min(1.0, (2 * best - duration_sec) / best))
+            bonus = int(round(SPEED_BONUS_MAX * ratio))
 
-    async def _maybe_apply_role(self, member: discord.Member, new_level: int):
-        guild_map = ROLE_MAP_BY_GUILD.get(member.guild.id, {})
-        role_id = guild_map.get(new_level)
-        if not role_id:
-            return
-        role = member.guild.get_role(role_id)
-        if not role:
-            return
-        to_remove = [member.guild.get_role(rid) for lvl, rid in guild_map.items() if lvl != new_level]
-        try:
-            if to_remove:
-                await member.remove_roles(*[r for r in to_remove if r in member.roles], reason="Level role update")
-            await member.add_roles(role, reason="Level up role")
-        except discord.Forbidden:
-            pass
+        applied = base + bonus
+        note = f"(+{bonus} speed bonus)" if bonus > 0 else ""
 
-    async def _announce_level_up(self, member: discord.Member, new_level: int):
-        try:
-            await member.send(f"📡 Rank Unlocked: **Level {new_level}** — nice work, Operative.")
-        except discord.Forbidden:
-            pass
+        st = await self.store.get_or_create_user(member.id, member.guild.id)
+        new_xp = st.xp + applied
+        new_level = await self.store.recompute_level(new_xp)
+        leveled = new_level > st.level
+        await self.store.update_user(member.id, member.guild.id, xp=new_xp, level=new_level)
+        st.xp, st.level = new_xp, new_level
+        return st, applied, leveled, note
 
-    @commands.hybrid_command(name="rank", description="Show your (or another user's) level and XP.")
-    async def rank(self, ctx: commands.Context, member: Optional[discord.Member] = None):
-        if not member:
-            member = ctx.author
-        state = await self.store.get_or_create_user(member.id, ctx.guild.id)
-        nt = next_threshold(state.level)
-        xp_to_next = "MAX" if nt is None else max(0, nt - state.xp)
-        emb = discord.Embed(title=f"{member.display_name} — Level {state.level}",
-                            description=f"XP: **{state.xp}**  •  Next level: **{xp_to_next}**",
-                            color=discord.Color.blue())
-        emb.add_field(name="Hacks Completed", value=str(state.hacks_completed))
-        if state.last_hack_at:
-            emb.add_field(name="Last Hack", value=f"<t:{int(dt.datetime.fromisoformat(state.last_hack_at).timestamp())}:R>")
-        if state.last_online_at:
-            emb.add_field(name="Last Online", value=f"<t:{int(dt.datetime.fromisoformat(state.last_online_at).timestamp())}:R>")
-        await ctx.reply(embed=emb, mention_author=False)
+    async def add_xp_delta(self, member: discord.Member, delta: int, *, note: str = ""):
+        """Add or subtract XP, clamp at >= 0, recompute level."""
+        st = await self.store.get_or_create_user(member.id, member.guild.id)
+        new_xp = max(0, st.xp + int(delta))
+        new_level = await self.store.recompute_level(new_xp)
+        await self.store.update_user(member.id, member.guild.id, xp=new_xp, level=new_level)
+        st.xp, st.level = new_xp, new_level
+        return st
 
-    @commands.hybrid_command(name="leaderboard", description="Top operatives by level and XP.")
-    async def leaderboard(self, ctx: commands.Context):
-        rows = await self.store.top_users(ctx.guild.id, limit=10)
-        if not rows:
-            return await self.reply("No data yet.")
+# ---------- Perk P3 Daily Cooldown ----------
+
+    async def perk_can_use_p3(self, member: discord.Member):
+        last = await self.store.get_last_p3(member.id, member.guild.id)
+        now = time.time()
+        if last is None:
+            return True, 0
+        elapsed = now - float(last)
+        if elapsed >= P3_COOLDOWN_SECONDS:
+            return True, 0
+        return False, P3_COOLDOWN_SECONDS - elapsed
+
+    async def perk_mark_p3_used(self, member: discord.Member):
+        await self.store.set_last_p3(member.id, member.guild.id, time.time())
+
+    # ---------- Commands ----------
+
+    @commands.command(name="rank")
+    async def rank_cmd(self, ctx: commands.Context):
+        st = await self.store.get_or_create_user(ctx.author.id, ctx.guild.id)
+        await ctx.send(f"🛰️ **{ctx.author.display_name}** — Level **{st.level}**, XP **{st.xp}**")
+
+    @commands.command(name="leaderboard")
+    async def leaderboard_cmd(self, ctx: commands.Context):
+        top = await self.store.top_users(ctx.guild.id, limit=10)
+        if not top:
+            return await ctx.send("No records yet.")
         lines = []
-        for i, r in enumerate(rows, 1):
-            uid = r["user_id"]
-            member = ctx.guild.get_member(uid)
-            name = member.display_name if member else f"User {uid}"
-            lines.append(f"**{i}.** {name} — Level **{r['level']}** ({r['xp']} XP)")
-        emb = discord.Embed(title=f"{ctx.guild.name} — Leaderboard", description="\n".join(lines), color=discord.Color.gold())
-        await ctx.reply(embed=emb, mention_author=False)
+        for i, row in enumerate(top, start=1):
+            member = ctx.guild.get_member(row.user_id)
+            name = member.display_name if member else f"User {row.user_id}"
+            lines.append(f"{i}. **{name}** — Level {row.level} • {row.xp} XP")
+        await ctx.send("🏆 **Top Operatives**\n" + "\n".join(lines))
 
-    # ---- admin tools ----
-    def _is_admin(self, ctx: commands.Context) -> bool:
-        perms = getattr(ctx.author.guild_permissions, "administrator", False)
-        return perms or (ctx.author.id == ctx.guild.owner_id)
+    # Admin helpers
+    @commands.has_guild_permissions(administrator=True)
+    @commands.command(name="xp")
+    async def xp_admin(self, ctx: commands.Context, action: str, member: discord.Member, amount: int):
+        action = action.lower()
+        if action == "add":
+            st = await self.add_xp_delta(member, amount, note="admin add")
+            await ctx.send(f"✅ Added {amount} XP to {member.mention} → Level {st.level}, {st.xp} XP")
+        elif action == "set":
+            st = await self.store.get_or_create_user(member.id, ctx.guild.id)
+            new_xp = max(0, int(amount))
+            new_level = await self.store.recompute_level(new_xp)
+            await self.store.update_user(member.id, ctx.guild.id, xp=new_xp, level=new_level)
+            await ctx.send(f"✅ Set {member.mention} to {new_xp} XP → Level {new_level}")
+        else:
+            await ctx.send("Usage: `\\xp add @user <amount>` or `\\xp set @user <amount>`")
 
-    @commands.hybrid_group(name="xp", description="Admin: adjust XP")
-    async def xp(self, ctx: commands.Context):
-        if ctx.invoked_subcommand is None:
-            await ctx.reply("Subcommands: add, set")
-
-    @xp.command(name="add", description="Admin: add XP to a user")
-    async def xp_add(self, ctx: commands.Context, member: discord.Member, amount: int):
-        if not self._is_admin(ctx):
-            return await ctx.reply("You need admin to do that.")
-        state, applied, leveled = await self.store.add_xp(member.id, ctx.guild.id, amount, "admin_add")
-        await ctx.reply(f"Added **{applied} XP** to {member.display_name}. Now **{state.xp} XP**, Level **{state.level}**.")
-        if leveled:
-            await self._maybe_apply_role(member, state.level)
-            await self._announce_level_up(member, state.level)
-
-    @xp.command(name="set", description="Admin: set XP for a user")
-    async def xp_set(self, ctx: commands.Context, member: discord.Member, amount: int):
-        if not self._is_admin(ctx):
-            return await ctx.reply("You need admin to do that.")
-        new_level = level_for_xp(amount)
-        await self.store.update_user_meta(member.id, ctx.guild.id, xp=amount, level=new_level)
-        state = await self.store.get_or_create_user(member.id, ctx.guild.id)
-        await ctx.reply(f"Set {member.display_name} to **{amount} XP**, Level **{state.level}**.")
-
-    @commands.hybrid_group(name="level", description="Admin: adjust level")
-    async def level_cmd(self, ctx: commands.Context):
-        if ctx.invoked_subcommand is None:
-            await ctx.reply("Subcommands: set")
-
-    @level_cmd.command(name="set", description="Admin: set level for a user (0-4)")
-    async def level_set(self, ctx: commands.Context, member: discord.Member, level: int):
-        if not self._is_admin(ctx):
-            return await self.reply("You need admin to do that.")
-        level = max(0, min(MAX_LEVEL, level))
-        xp = LEVEL_THRESHOLDS[level]
-        await self.store.update_user_meta(member.id, ctx.guild.id, level=level, xp=xp)
-        await ctx.reply(f"{member.display_name} set to Level **{level}** ({xp} XP).")
-        await self._maybe_apply_role(member, level)
+    @commands.has_guild_permissions(administrator=True)
+    @commands.command(name="level")
+    async def level_admin(self, ctx: commands.Context, action: str, member: discord.Member, amount: int):
+        if action.lower() != "set":
+            return await ctx.send("Usage: `\\level set @user <level>`")
+        lvl = max(0, min(4, int(amount)))
+        st = await self.store.get_or_create_user(member.id, ctx.guild.id)
+        await self.store.update_user(member.id, ctx.guild.id, xp=st.xp, level=lvl)
+        await ctx.send(f"✅ Set {member.mention} to **Level {lvl}**")
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(LevelsCog(bot))
