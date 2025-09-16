@@ -8,8 +8,8 @@ Log in with your alias, dive into terminal-style hacking puzzles, earn XP, and c
 ## ✨ Features
 
 - 🎮 **Word-scramble hacks**  
-  - `\shell 01` → Easy (3 minutes)  
-  - `\shell 02` → Hard (90 seconds)  
+  - `\shell 01` → Easy (90 seconds)  
+  - `\shell 02` → Hard (3 minutes)  
 
 - 🧩 **Randomized puzzle pools**  
   - 100+ Star Citizen–related words (ships, planets, moons, locales)  
