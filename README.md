@@ -48,3 +48,42 @@ Log in with your alias, dive into terminal-style hacking puzzles, earn XP, and c
 
 \clear terminal       → Clear last 100 messages
 \subnet <msg>         → Chat with Subnet AI
+
+
+## 🧬 Perks (v1.2)
+
+Levelled operatives can trigger **one perk per hack** using quick commands:
+
+- `\p1 — Reveal`  
+  Reveals **2 letters** of the answer at random positions.  
+  *Subnet:* “Releasing partial cipher. Keep pressure on the node.”
+
+- `\p2 — Stall`  
+  Adds **+10 seconds** to the current hack’s timer (deadline extended).  
+  *Subnet:* “Holding the gate. Window extended ten seconds.”
+
+- `\p3 — Bypass`  
+  **Instant success** (auto-completes the hack and awards XP).  
+  *Subnet:* “Bypass injected. ATC uplink green.”
+
+- `\p4 — Overclock`  
+  **Chance to auto-solve**. Success chance scales with level:  
+  `chance = min(0.30 + 0.10 * level, 0.70)` → at Level 4 this is **60%**.  
+  *Subnet:* “Spinning exploit… stand by.” → success/fail feedback shown.
+
+> 🔒 Perk locks by level: `\p1` (Lvl 1+), `\p2` (Lvl 2+), `\p3` (Lvl 3+), `\p4` (Lvl 4).  
+> ⚖️ Only **one perk** may be used per hack (even if `\p4` fails).
+
+
+
+## 🗒️ Changelog
+
+### 1.2
+- Added perk system with quick commands: `\p1` (Reveal), `\p2` (Stall +10s), `\p3` (Bypass), `\p4` (Overclock chance).
+- Implemented real deadline-based timers (enables pausing/extension).
+- Subnet AI flavor lines for perk activations.
+- Keeps no-repeat word queues, requester tagging, and XP integration from v1.0/1.1.
+
+### 1.0
+- Initial release: Star Citizen–themed word-scramble hacks, XP levels (0–4), rank/leaderboard, optional Subnet AI.
+

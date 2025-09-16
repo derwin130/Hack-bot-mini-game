@@ -42,19 +42,21 @@ EASY_WORDS = [
 # Harder: longer names/places/systems but still “friendly” (100 items)
 HARD_WORDS = [
     # 1-25
-    "caterpillar","starfarer","retaliator","harbinger","warglaive","peregrine","starlifter","genesis","pioneer",
-    "endeavor","idris","hammerhead","scorpius","microtech","newbabbage","area18","lorville","orison","baijinipoint",
-    "porttressler","grimhex","portolisar","refinery","hurston",
+    "caterpillar","starfarer","retaliator","harbinger","warglaive","percheron","peregrine","starlifter","genesis","pioneer",
+    "endeavor","idris","hammerhead","scorpiusrx","microtech","newbabbage","area18","lorvillemetro","orisonplatform","baijinipoint",
+    "porttressler","grimhexstation","portolisar","refinerystation","hurstonsecurity",
     # 26-50
-    "crusader","shubin","covalex","terminal","banshee","kareah","jumptown","outpost","hydroponics","scrapyard","blacksite",
-    "datavault","commarray","quantumtravel","quantumbeacon","commlink","distresssignal","surfaceharvest","armistice","interdiction","contraband","newdeal",
+    "crusaderindustry","shubinmining","covalex","tddterminal","adminoffice","banshee","kareah","jumptown","sherman","outposttheta",
+    "hydroponics","scrapyard","blacksite","datavault","commarray","quantumtravel","quantumbeacon","commlink","distresssignal","surfaceharvest",
+    "deepcavern","armistice","interdiction","contraband","newdeals",
     # 51-75
-    "teasa","astroarmada","cubbyblast","dumpersdepot","apex","vision","gates","microtech","clouds",
-    "icefield","glacier","gravlev","quantumdrive","generator","powerplant","cooler","hardpoint","navmarker","waypoint",
-    "overclock","underclock","firmware","infiltration",
+    "teasa","astroarmada","cubbyblast","dumpersdepot","tammanysons","apex","orisonvision","lorvillegates","microtechlabs","crusaderclouds",
+    "icefield","glacier","gravlev","quantumdrive","shieldgenerator","powerplant","coolers","hardpoints","navmarker","waypoints",
+    "overclock","underclock","firmware","backtrace","infiltration",
     # 76-100
-    "exfiltration","decryption","encryption","synchronization","configuration","virtualization","fragmentation","exploitation","reconnaissance",
-    "surveillance","transponder","starchart","protocols","failsafe","tracker","network","voidspace","zone","starlancer","ironclad","starforge","overwatch",
+    "exfiltration","triangulation","decryption","encryption","synchronization","configuration","virtualization","fragmentation","exploitation","reconnaissance",
+    "surveillance","transponder","starchart","astronavigation","subprotocols","failsafe","startracker","satnetwork","voidspace","nullzone",
+    "starlance","ironclad","starforge","helicarrier","overwatch",
 ]
 
 # Ensure exactly 100 each (pad with safe placeholders if needed)
@@ -190,14 +192,19 @@ async def cancel_timer(task):
         except asyncio.CancelledError:
             pass
 
-async def timeout_handler(ctx, user_id, seconds):
-    try:
-        await asyncio.sleep(seconds)
-    except asyncio.CancelledError:
-        return
-    session = active_sessions.get(user_id)
-    if session and session.get("scramble"):
-        await end_current_hack(ctx, user_id, timed_out=True)
+async def timeout_watcher(ctx, user_id):
+    """Checks per-user hack deadline every second; times out when now >= deadline."""
+    while True:
+        await asyncio.sleep(1)
+        session = active_sessions.get(user_id)
+        if not session or not session.get("scramble"):
+            return
+        deadline = session.get("deadline")
+        if not deadline:
+            return
+        if time.monotonic() >= deadline:
+            await end_current_hack(ctx, user_id, timed_out=True)
+            return
 
 def requester_line(ctx, session):
     alias = session.get("alias")
@@ -218,8 +225,13 @@ async def end_current_hack(ctx, user_id, timed_out=False, failed=False, success=
     difficulty = session.get("difficulty")
     started_at = session.get("started_at")
 
+    # stop task and CLEAR all session fields (include perk/timer stuff)
     await cancel_timer(session.get("task"))
-    session.update({"scramble": None, "answer": None, "tries": 0, "task": None, "difficulty": None, "started_at": None})
+    session.update({
+        "scramble": None, "answer": None, "tries": 0, "task": None,
+        "difficulty": None, "started_at": None,
+        "perk_used": False, "revealed_indices": set(), "deadline": None
+    })
 
     if success:
         await ctx.send("✅ **Hack successful — access granted** // ATC uplink synced. Clearance updated on mobiGlas.")
@@ -282,7 +294,8 @@ async def on_message(message: discord.Message):
         if key == "online":
             active_sessions[message.author.id] = {
                 "alias": alias, "scramble": None, "answer": None,
-                "tries": 0, "task": None, "difficulty": None, "started_at": None
+                "tries": 0, "task": None, "difficulty": None, "started_at": None,
+                "perk_used": False, "revealed_indices": set(), "deadline": None
             }
             await message.channel.send(f"💻 {alias} logged in. Use `\\shell 01` or `\\shell 02`.")
 
@@ -327,9 +340,11 @@ async def shell_cmd(ctx: commands.Context, *, arg: str = None):
         await cancel_timer(session.get("task"))
         session.update({
             "scramble": scramble, "answer": word, "tries": 3, "difficulty": "easy",
-            "task": asyncio.create_task(timeout_handler(ctx, user_id, EASY_TIME)),
-            "started_at": time.monotonic()
+            "started_at": time.monotonic(),
+            "perk_used": False, "revealed_indices": set(),
+            "deadline": time.monotonic() + EASY_TIME
         })
+        session["task"] = asyncio.create_task(timeout_watcher(ctx, user_id))
         await ctx.send(
             f"💻 **RCE (EASY)**\n{requester_line(ctx, session)}\n"
             f"🔐 Unscramble: `{scramble}`\n⏳ 3 minutes\n⚡ `\\RCE <answer>`"
@@ -341,9 +356,11 @@ async def shell_cmd(ctx: commands.Context, *, arg: str = None):
         await cancel_timer(session.get("task"))
         session.update({
             "scramble": scramble, "answer": word, "tries": 3, "difficulty": "hard",
-            "task": asyncio.create_task(timeout_handler(ctx, user_id, HARD_TIME)),
-            "started_at": time.monotonic()
+            "started_at": time.monotonic(),
+            "perk_used": False, "revealed_indices": set(),
+            "deadline": time.monotonic() + HARD_TIME
         })
+        session["task"] = asyncio.create_task(timeout_watcher(ctx, user_id))
         await ctx.send(
             f"💻 **RCE (HARD)**\n{requester_line(ctx, session)}\n"
             f"🔐 Unscramble: `{scramble}`\n⏳ 90 seconds\n⚡ `\\RCE <answer>`"
@@ -402,6 +419,112 @@ async def subnet_cmd(ctx, *, message: str = None):
     if not line.strip():
         line = "🛰️ Subnet link active. (No content received.)"
     await ctx.send(line)
+
+# ---------- Perk helpers & commands (v1.2) ----------
+
+async def get_user_level(member: discord.Member) -> int:
+    """Returns the user's current level (0-4) using LevelsCog; falls back to 0 on error."""
+    levels = bot.get_cog("LevelsCog")
+    if not levels:
+        return 0
+    try:
+        state = await levels.store.get_or_create_user(member.id, member.guild.id)
+        return int(state.level)
+    except Exception:
+        return 0
+
+def _ensure_active(ctx):
+    user_id = ctx.author.id
+    session = active_sessions.get(user_id)
+    if not session:
+        return None, "⚠️ No active session."
+    if not session.get("scramble"):
+        return None, "⚠️ No active hack."
+    return session, None
+
+def _perk_already_used(session):
+    return session.get("perk_used", False)
+
+async def _mark_perk_used(ctx, session, note: str):
+    session["perk_used"] = True
+    line = await ai_say_subnet(note) if have_openai() else ""
+    await ctx.send(f"{line or '🛰️ [Subnet]'}")
+
+@bot.command(name="p1")
+async def perk_reveal(ctx: commands.Context):
+    session, err = _ensure_active(ctx)
+    if err: return await ctx.send(err)
+    if _perk_already_used(session):
+        return await ctx.send("⚡ Perk already used for this hack.")
+    # Level check (level 1+)
+    level = await get_user_level(ctx.author)
+    if level < 1:
+        return await ctx.send("🔒 Perk locked. Reach **Level 1** to use `\\p1`.")
+    # Reveal 2 distinct indices
+    answer = session["answer"]
+    n = len(answer)
+    idxs = set(session.get("revealed_indices", set()))
+    choices = [i for i in range(n) if i not in idxs]
+    if len(choices) == 0:
+        return await ctx.send("ℹ️ Nothing to reveal.")
+    pick_count = 2 if len(choices) >= 2 else 1
+    pick = random.sample(choices, k=pick_count)
+    idxs.update(pick)
+    session["revealed_indices"] = idxs
+    # Build masked hint
+    hint = "".join(ch if i in idxs else "•" for i, ch in enumerate(answer))
+    await _mark_perk_used(ctx, session, "Releasing partial cipher. Keep pressure on the node.")
+    await ctx.send(f"🧩 **Reveal** → `{hint}`")
+
+@bot.command(name="p2")
+async def perk_pause(ctx: commands.Context):
+    session, err = _ensure_active(ctx)
+    if err: return await ctx.send(err)
+    if _perk_already_used(session):
+        return await ctx.send("⚡ Perk already used for this hack.")
+    level = await get_user_level(ctx.author)
+    if level < 2:
+        return await ctx.send("🔒 Perk locked. Reach **Level 2** to use `\\p2`.")
+    # Extend deadline by 10s
+    dl = session.get("deadline")
+    if not dl:
+        return await ctx.send("ℹ️ No active timer.")
+    session["deadline"] = dl + 10.0
+    await _mark_perk_used(ctx, session, "Holding the gate. Window extended ten seconds.")
+    await ctx.send("⏱️ **Stall** → +10s added to the clock.")
+
+@bot.command(name="p3")
+async def perk_skip(ctx: commands.Context):
+    session, err = _ensure_active(ctx)
+    if err: return await ctx.send(err)
+    if _perk_already_used(session):
+        return await ctx.send("⚡ Perk already used for this hack.")
+    level = await get_user_level(ctx.author)
+    if level < 3:
+        return await ctx.send("🔒 Perk locked. Reach **Level 3** to use `\\p3`.")
+    await _mark_perk_used(ctx, session, "Bypass injected. ATC uplink green.")
+    await end_current_hack(ctx, ctx.author.id, success=True)
+
+@bot.command(name="p4")
+async def perk_autosolve(ctx: commands.Context):
+    session, err = _ensure_active(ctx)
+    if err: return await ctx.send(err)
+    if _perk_already_used(session):
+        return await ctx.send("⚡ Perk already used for this hack.")
+    level = await get_user_level(ctx.author)
+    if level < 4:
+        return await ctx.send("🔒 Perk locked. Reach **Level 4** to use `\\p4`.")
+    # Chance formula: base 30% + 10% * level; capped at 70%
+    chance = min(0.30 + 0.10 * level, 0.70)
+    roll = random.random()
+    await ctx.send("🎲 Running exploit…")
+    if roll <= chance:
+        await _mark_perk_used(ctx, session, "Exploit latched. Solved.")
+        await end_current_hack(ctx, ctx.author.id, success=True)
+    else:
+        session["perk_used"] = True  # consumed even on fail
+        line = await ai_say_subnet("Exploit rejected. ICE held.") if have_openai() else ""
+        await ctx.send(f"{line or '🛰️ [Subnet]'}\n❗ **Overclock failed.** Keep trying.")
 
 # --- Run Bot ---
 if __name__ == "__main__":
