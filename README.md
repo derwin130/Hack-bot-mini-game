@@ -50,39 +50,50 @@ Log in with your alias, dive into terminal-style hacking puzzles, earn XP, and c
 \subnet <msg>         → Chat with Subnet AI
 
 
-## 🧬 Perks (v1.2)
+## 🧬 Perks (v1.3)
 
-Levelled operatives can trigger **one perk per hack** using quick commands:
+Perks add clutch tools during a hack. **Level 4 can use up to 2 perks per hack**; all other levels can use **1 perk per hack**.  
+Use quick commands:
 
 - `\p1 — Reveal`  
   Reveals **2 letters** of the answer at random positions.  
-  *Subnet:* “Releasing partial cipher. Keep pressure on the node.”
+  *Subnet:* “Releasing partial cipher. Keep pressure on the node.”  
+  *Unlock:* Level 1+
 
 - `\p2 — Stall`  
-  Adds **+10 seconds** to the current hack’s timer (deadline extended).  
-  *Subnet:* “Holding the gate. Window extended ten seconds.”
+  Adds **+10 seconds** to the current hack’s timer.  
+  *Subnet:* “Holding the gate. Window extended ten seconds.”  
+  *Unlock:* Level 2+
 
-- `\p3 — Bypass`  
-  **Instant success** (auto-completes the hack and awards XP) *Can only be used once per day  
-  *Subnet:* “Bypass injected. ATC uplink green.”
+- `\p3 — Bypass` *(once per day per user)*  
+  **Instant success** (awards XP as normal).  
+  *Subnet:* “Bypass injected. ATC uplink green.”  
+  *Unlock:* Level 3+ • **Daily limit**
 
-- `\p4 — Overclock`  
-  **Chance to auto-solve**. Success chance scales with level:  
-  `chance = min(0.30 + 0.10 * level, 0.70)` → at Level 4 this is **60%**.  
-  *Subnet:* “Spinning exploit… stand by.” → success/fail feedback shown.
+- `\p4 — Overclock` *(risk vs reward)*  
+  **Chance to auto-solve**. Chance = `min(30% + 10% × level, 70%)` (Level 4 ⇒ 60%).  
+  **If it fails, you lose 5 XP.**  
+  *Subnet:* “Spinning exploit… stand by.” → success/fail feedback shown  
+  *Unlock:* Level 4+
 
-> 🔒 Perk locks by level: `\p1` (Lvl 1+), `\p2` (Lvl 2+), `\p3` (Lvl 3+), `\p4` (Lvl 4).  
-> ⚖️ Only **one perk** may be used per hack (even if `\p4` fails).
+> ⚖️ **Per-hack limit:** Level 0–3 → 1 perk; **Level 4 → 2 perks** (any mix; `\p3` still has daily cooldown).  
+> 🔒 Only one active puzzle per word across the server (no duplicate live puzzles).
 
 
 
 ## 🗒️ Changelog
 
+### 1.3
+- **Global puzzle lock:** only one active puzzle per word across the server.
+- **Perk limits:** Level 0–3 → 1 perk per hack; **Level 4 → 2 perks** per hack.
+- **\p3 (Bypass):** now **once per day** per user.
+- **\p4 (Overclock):** failure applies **–5 XP** penalty.
+- Confirmed timer swap: Easy **90s**, Hard **180s**.
+- Minor wording and balance tweaks.
+
 ### 1.2
 - Added perk system with quick commands: `\p1` (Reveal), `\p2` (Stall +10s), `\p3` (Bypass), `\p4` (Overclock chance).
-- Implemented real deadline-based timers (enables pausing/extension).
-- Subnet AI flavor lines for perk activations.
-- Keeps no-repeat word queues, requester tagging, and XP integration from v1.0/1.1.
+- Implemented deadline-based timers and Subnet flavor lines.
 
 ### 1.0
 - Initial release: Star Citizen–themed word-scramble hacks, XP levels (0–4), rank/leaderboard, optional Subnet AI.
